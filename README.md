@@ -1,6 +1,6 @@
 # Igris Inertial Rust SDK
 
-Rust client for [Igris Inertial](https://igris-inertial.com) -- the AI inference gateway with multi-provider routing, SLO enforcement, fleet management, and BYOK vault.
+Rust client for [Igris Inertial](https://igris-inertial.com) — an agent execution platform that runs AI workflows inside a Rust runtime with deterministic containment, Ed25519-signed execution receipts, and multi-provider inference routing.
 
 ## Installation
 
@@ -40,13 +40,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Features
 
-- **Async-first** with tokio and reqwest
-- **Multi-provider inference** -- Route across OpenAI, Anthropic, Google, and more
-- **Provider management** -- Register, test, and monitor providers
-- **BYOK vault** -- Securely store and rotate your own API keys
-- **Fleet management** -- Register and monitor inference agents
-- **Usage tracking** -- Monitor costs and token usage
-- **Strong typing** with serde derive
+- **Async-first** — Built on tokio and reqwest
+- **Strong typing** — Serde-derived (de)serialization for all types
+- **Deterministic agent execution** — Agents run inside the Igris Runtime with enforced CPU, memory, and I/O containment bounds
+- **Cryptographic execution receipts** — Ed25519-signed resource-accounting data with hash-chained tamper evidence; opt-in verification with `verify_receipt`
+- **Multi-provider inference routing** — Route across OpenAI, Anthropic, Google, and more with SLO-based fallback
+- **BYOK vault** — Securely store and rotate your own provider API keys
+- **Fleet management** — Register and monitor agent fleets
+- **Usage tracking** — Monitor costs and token usage
 
 ## API
 
