@@ -1,204 +1,118 @@
-# Schlep-engine Rust SDK
+# Igris Inertial Rust SDK
 
-Official Rust SDK for the Schlep-engine API platform.
-
-[![Crates.io](https://img.shields.io/crates/v/igris_overture.svg)](https://crates.io/crates/igris_overture)
-[![Documentation](https://docs.rs/igris_overture/badge.svg)](https://docs.rs/igris_overture)
-[![License](https://img.shields.io/crates/l/igris_overture.svg)](LICENSE)
-
-## Features
-
-- 🚀 **Fast & Async**: Built on tokio and reqwest for high-performance async operations
-- 🔒 **Type-safe**: Fully typed API with serde for serialization
-- 🛡️ **Error Handling**: Comprehensive error types with detailed messages
-- 📡 **Streaming**: WebSocket support for real-time events
-- 🔑 **Authentication**: Bearer token authentication with environment variable support
-- 📚 **Well Documented**: Extensive documentation and examples
+Rust client for [Igris Inertial](https://igris-inertial.com) -- the AI inference gateway with multi-provider routing, SLO enforcement, fleet management, and BYOK vault.
 
 ## Installation
 
-Add this to your `Cargo.toml`:
+Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-igris_overture = "1.0.0"
-tokio = { version = "1.0", features = ["full"] }
+igris-inertial = "0.1"
+tokio = { version = "1", features = ["full"] }
 ```
 
 ## Quick Start
 
 ```rust
-use igris_overture::{SchlepClient, Result};
-use serde_json::json;
+use igris_inertial::{IgrisClient, InferRequest, Message};
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    // Create client with API key
-    let client = SchlepClient::new("your-api-key")?;
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = IgrisClient::builder("https://api.igris-inertial.com")
+        .api_key("your-api-key")
+        .build()?;
 
-    // Or from environment variable SCHLEP_API_KEY
-    let client = SchlepClient::from_env()?;
+    let response = client.infer(&InferRequest {
+        model: "gpt-4".to_string(),
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: "Hello!".to_string(),
+            content_parts: None,
+        }],
+        ..Default::default()
+    }).await?;
 
-    // Upload data
-    let upload_result = client.upload("Hello, world!").await?;
-    println!("Upload job ID: {}", upload_result.job_id);
-
-    // Train a model
-    let train_config = json!({
-        "model_type": "classification",
-        "dataset_id": upload_result.job_id
-    });
-    let train_result = client.train(train_config).await?;
-
-    // Deploy model
-    if let Some(model_id) = train_result.model_id {
-        let deploy_result = client.deploy(&model_id).await?;
-        println!("Model deployed at: {}", deploy_result.endpoint_url);
-    }
-
+    println!("{}", response.choices[0].message.content);
     Ok(())
 }
 ```
 
-## API Reference
+## Features
 
-### Client Creation
+- **Async-first** with tokio and reqwest
+- **Multi-provider inference** -- Route across OpenAI, Anthropic, Google, and more
+- **Provider management** -- Register, test, and monitor providers
+- **BYOK vault** -- Securely store and rotate your own API keys
+- **Fleet management** -- Register and monitor inference agents
+- **Usage tracking** -- Monitor costs and token usage
+- **Strong typing** with serde derive
+
+## API
 
 ```rust
-// With API key
-let client = SchlepClient::new("your-api-key")?;
+// Inference
+client.infer(&request).await?;
+client.chat_completion(&request).await?;
+client.list_models().await?;
+client.health().await?;
 
-// From environment variable
-let client = SchlepClient::from_env()?;
+// Providers
+client.providers().register(&config).await?;
+client.providers().list().await?;
+client.providers().test(&config).await?;
+client.providers().health("id").await?;
+client.providers().delete("id").await?;
 
-// With custom base URL
-let client = SchlepClient::with_base_url("your-api-key", "https://custom.api.com/v1")?;
+// Vault
+client.vault().store(&request).await?;
+client.vault().list().await?;
+client.vault().rotate("openai").await?;
+client.vault().delete("openai").await?;
+
+// Fleet
+client.fleet().register(&config).await?;
+client.fleet().agents().await?;
+client.fleet().health().await?;
+
+// Usage & Audit
+client.usage().current().await?;
+client.usage().history().await?;
+client.audit().list().await?;
 ```
 
-### Upload Data
+## Execution Receipt Verification (v2.2.0+)
+
+When Overture is backed by a Runtime instance, inference responses include an
+`execution_receipt` with signed resource-accounting data. Verification is
+opt-in.
 
 ```rust
-let result = client.upload("your data here").await?;
-println!("Job ID: {}", result.job_id);
-```
+use igris_inertial::{verify_receipt, IgrisClient};
+use ed25519_dalek::VerifyingKey;
 
-### Train Model
+let resp = client.infer(req).await?;
 
-```rust
-let config = json!({
-    "model_type": "classification",
-    "dataset_id": "upload_job_123",
-    "parameters": {
-        "algorithm": "random_forest"
-    }
-});
-let result = client.train(config).await?;
-```
+if let Some(receipt) = &resp.execution_receipt {
+    let pub_key_bytes: [u8; 32] = hex::decode("...") // IGRIS_RUNTIME_PUBLIC_KEY
+        .unwrap().try_into().unwrap();
+    let vk = VerifyingKey::from_bytes(&pub_key_bytes)?;
 
-### Deploy Model
-
-```rust
-let result = client.deploy("model_456").await?;
-println!("Endpoint: {}", result.endpoint_url);
-```
-
-### Check Status
-
-```rust
-let status = client.status("job_123").await?;
-println!("Status: {}", status.status);
-if let Some(progress) = status.progress {
-    println!("Progress: {}%", progress);
+    verify_receipt(receipt, &vk)?;
+    println!("cpu={}ms violation={}", receipt.cpu_time_ms, receipt.violation_occurred);
 }
 ```
 
-### Stream Events
+`verify_receipt` is never called automatically. Responses from servers that do
+not emit receipts decode normally — `execution_receipt` will be `None`.
 
-```rust
-use igris_overture::StreamConfig;
+## Changelog
 
-let config = StreamConfig {
-    event_types: vec!["training".to_string(), "deployment".to_string()],
-    filters: Default::default(),
-};
-
-client.stream(config).await?;
-```
-
-## Error Handling
-
-The SDK provides comprehensive error handling:
-
-```rust
-match client.upload("data").await {
-    Ok(result) => println!("Success: {}", result.job_id),
-    Err(igris_overture::Error::Api { code, message }) => {
-        eprintln!("API error {}: {}", code, message);
-    }
-    Err(igris_overture::Error::Http(e)) => {
-        eprintln!("Network error: {}", e);
-    }
-    Err(igris_overture::Error::Config(e)) => {
-        eprintln!("Configuration error: {}", e);
-    }
-    Err(e) => {
-        eprintln!("Other error: {}", e);
-    }
-}
-```
-
-## Environment Variables
-
-- `SCHLEP_API_KEY`: Your Schlep-engine API key
-
-## Build and Test
-
-```bash
-# Build the project
-cargo build
-
-# Run tests
-cargo test
-
-# Run example
-export SCHLEP_API_KEY=your-api-key-here
-cargo run --example igris_overture_example
-
-# Generate documentation
-cargo doc --open
-```
-
-## Testing
-
-The SDK includes comprehensive tests with mocked HTTP responses:
-
-```bash
-# Run all tests
-cargo test
-
-# Run integration tests only
-cargo test --test integration_tests
-
-# Run tests with output
-cargo test -- --nocapture
-```
-
-## Examples
-
-Check out the [examples](examples/) directory for more usage examples:
-
-- [Basic Usage](examples/main.rs) - Complete workflow from upload to deployment
+### 2.2.0
+- Added `ExecutionReceipt` struct to response types
+- Added `execution_receipt` optional field to `InferResponse`
+- Added `verify_receipt(receipt, &VerifyingKey) -> Result<()>` helper (ed25519-dalek + sha2)
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Support
-
-- 📖 [Documentation](https://docs.igris-inertial.com/sdk/rust)
-- 🐛 [Issues](https://github.com/igris-inertial/rust-sdk/issues)
-- 💬 [Support](https://support.igris-inertial.com)
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+MIT

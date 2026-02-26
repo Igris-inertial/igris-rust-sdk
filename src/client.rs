@@ -1,658 +1,254 @@
-//! Main client implementation for the Schlep-engine Rust SDK.
+//! Main Igris Inertial client.
 
-use std::env;
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 
-use reqwest::{Client, Response, header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE}};
-use serde_json::Value;
-use tokio_tungstenite::connect_async;
-use url::Url;
+use crate::errors::IgrisError;
+use crate::fleet::FleetManager;
+use crate::providers::ProviderManager;
+use crate::types::*;
+use crate::usage::{AuditManager, UsageManager};
+use crate::vault::VaultManager;
 
-use crate::api::{
-    AdminClient, AnalyticsClient, DataClient, DocumentClient, MLClient, MonitoringClient,
-    QualityClient, StorageClient, UsersClient,
-};
-use crate::error::{Error, Result};
-use crate::types::{DeployResponse, StatusResponse, StreamConfig, TrainResponse, UploadResponse};
-use crate::DEFAULT_BASE_URL;
-
-/// Main client for interacting with the Schlep-engine API.
-///
-/// The client provides methods for uploading data, training models, deploying models,
-/// checking job status, and streaming real-time events.
-///
-/// # Authentication
-///
-/// The client requires an API key for authentication. You can provide it either:
-/// - As a parameter when creating the client: `SchlepClient::new("your-api-key")`
-/// - Via the `SCHLEP_API_KEY` environment variable
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use schlep_engine::{SchlepClient, Result};
-///
-/// #[tokio::main]
-/// async fn main() -> Result<()> {
-///     let client = SchlepClient::new("your-api-key")?;
-///
-///     let upload_result = client.upload("sample data").await?;
-///     println!("Upload job ID: {}", upload_result.job_id);
-///
-///     Ok(())
-/// }
-/// ```
-#[derive(Debug, Clone)]
-pub struct SchlepClient {
-    client: Client,
+/// Client for the Igris Inertial AI inference gateway.
+pub struct IgrisClient {
+    http: reqwest::Client,
     base_url: String,
-    api_key: String,
+    api_key: Option<String>,
+    #[allow(dead_code)]
+    tenant_id: Option<String>,
 }
 
-impl SchlepClient {
-    /// Create a new Schlep-engine client with the provided API key.
-    ///
-    /// # Arguments
-    ///
-    /// * `api_key` - Your Schlep-engine API key
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the API key is empty or if the HTTP client cannot be created.
-    pub fn new(api_key: impl Into<String>) -> Result<Self> {
-        let api_key = api_key.into();
-        if api_key.is_empty() {
-            return Err(Error::config_error("API key cannot be empty"));
+/// Builder for configuring an IgrisClient.
+pub struct IgrisClientBuilder {
+    base_url: String,
+    api_key: Option<String>,
+    timeout: std::time::Duration,
+    tenant_id: Option<String>,
+}
+
+impl IgrisClientBuilder {
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            api_key: None,
+            timeout: std::time::Duration::from_secs(30),
+            tenant_id: None,
+        }
+    }
+
+    pub fn api_key(mut self, key: impl Into<String>) -> Self {
+        self.api_key = Some(key.into());
+        self
+    }
+
+    pub fn timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn tenant_id(mut self, id: impl Into<String>) -> Self {
+        self.tenant_id = Some(id.into());
+        self
+    }
+
+    pub fn build(self) -> Result<IgrisClient, IgrisError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        if let Some(ref key) = self.api_key {
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {}", key))
+                    .map_err(|e| IgrisError::Api { message: e.to_string(), status_code: 0 })?,
+            );
+        }
+        if let Some(ref tid) = self.tenant_id {
+            headers.insert(
+                "X-Tenant-ID",
+                HeaderValue::from_str(tid)
+                    .map_err(|e| IgrisError::Api { message: e.to_string(), status_code: 0 })?,
+            );
         }
 
-        let client = Client::new();
-        Ok(Self {
-            client,
-            base_url: DEFAULT_BASE_URL.to_string(),
-            api_key,
+        let http = reqwest::Client::builder()
+            .default_headers(headers)
+            .timeout(self.timeout)
+            .build()?;
+
+        Ok(IgrisClient {
+            http,
+            base_url: self.base_url.trim_end_matches('/').to_string(),
+            api_key: self.api_key,
+            tenant_id: self.tenant_id,
         })
     }
+}
 
-    /// Create a new client using the API key from the `SCHLEP_API_KEY` environment variable.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the environment variable is not set or empty.
-    pub fn from_env() -> Result<Self> {
-        let api_key = env::var("SCHLEP_API_KEY")
-            .map_err(|_| Error::config_error("SCHLEP_API_KEY environment variable not set"))?;
-        Self::new(api_key)
+impl IgrisClient {
+    /// Create a new client with builder pattern.
+    pub fn builder(base_url: impl Into<String>) -> IgrisClientBuilder {
+        IgrisClientBuilder::new(base_url)
     }
 
-    /// Create a new client with a custom base URL.
-    ///
-    /// # Arguments
-    ///
-    /// * `api_key` - Your Schlep-engine API key
-    /// * `base_url` - Custom base URL for the API
-    pub fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Result<Self> {
-        let mut client = Self::new(api_key)?;
-        client.base_url = base_url.into();
-        Ok(client)
+    /// Simple constructor.
+    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Result<Self, IgrisError> {
+        Self::builder(base_url).api_key(api_key).build()
     }
 
-    /// Upload data to Schlep-engine for processing.
-    ///
-    /// # Arguments
-    ///
-    /// * `data` - The data to upload (can be text, JSON, etc.)
-    ///
-    /// # Returns
-    ///
-    /// Returns an `UploadResponse` containing the job ID and status.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use schlep_engine::{SchlepClient, Result};
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<()> {
-    /// let client = SchlepClient::new("your-api-key")?;
-    /// let result = client.upload("Hello, world!").await?;
-    /// println!("Job ID: {}", result.job_id);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn upload(&self, data: impl Into<String>) -> Result<UploadResponse> {
-        let url = format!("{}/upload", self.base_url);
-        let payload = serde_json::json!({
-            "data": data.into()
-        });
-
-        let response = self
-            .client
-            .post(&url)
-            .headers(self.default_headers()?)
-            .json(&payload)
-            .send()
-            .await?;
-
-        self.handle_response(response).await
+    pub(crate) fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url, path)
     }
 
-    /// Train a machine learning model with the provided configuration.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Training configuration (model type, dataset, parameters)
-    ///
-    /// # Returns
-    ///
-    /// Returns a `TrainResponse` containing the job ID and status.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use schlep_engine::{SchlepClient, TrainConfig, Result};
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<()> {
-    /// let client = SchlepClient::new("your-api-key")?;
-    /// let config = serde_json::json!({
-    ///     "model_type": "classification",
-    ///     "dataset_id": "upload_job_123"
-    /// });
-    /// let result = client.train(config).await?;
-    /// println!("Training job ID: {}", result.job_id);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn train(&self, config: Value) -> Result<TrainResponse> {
-        let url = format!("{}/train", self.base_url);
+    pub(crate) async fn request<T: serde::de::DeserializeOwned>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&impl serde::Serialize>,
+    ) -> Result<T, IgrisError> {
+        let mut req = self.http.request(method, self.url(path));
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        let resp = req.send().await?;
+        let status = resp.status().as_u16();
 
-        let response = self
-            .client
-            .post(&url)
-            .headers(self.default_headers()?)
-            .json(&config)
-            .send()
-            .await?;
+        if status == 401 || status == 403 {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(IgrisError::Authentication { message: text, status_code: status });
+        }
+        if status == 429 {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(IgrisError::RateLimit { message: text });
+        }
+        if status == 400 || status == 422 {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(IgrisError::Validation { message: text, status_code: status });
+        }
+        if status >= 400 {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(IgrisError::Api { message: text, status_code: status });
+        }
 
-        self.handle_response(response).await
+        let data = resp.json().await?;
+        Ok(data)
     }
 
-    /// Deploy a trained model to a production endpoint.
-    ///
-    /// # Arguments
-    ///
-    /// * `model_id` - ID of the trained model to deploy
-    ///
-    /// # Returns
-    ///
-    /// Returns a `DeployResponse` containing the deployment details.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use schlep_engine::{SchlepClient, Result};
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<()> {
-    /// let client = SchlepClient::new("your-api-key")?;
-    /// let result = client.deploy("model_123").await?;
-    /// println!("Endpoint URL: {}", result.endpoint_url);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn deploy(&self, model_id: &str) -> Result<DeployResponse> {
-        let url = format!("{}/deploy", self.base_url);
-        let payload = serde_json::json!({
-            "model_id": model_id
-        });
+    pub(crate) async fn request_no_body(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+    ) -> Result<(), IgrisError> {
+        let resp = self.http.request(method, self.url(path)).send().await?;
+        let status = resp.status().as_u16();
 
-        let response = self
-            .client
-            .post(&url)
-            .headers(self.default_headers()?)
-            .json(&payload)
-            .send()
-            .await?;
-
-        self.handle_response(response).await
-    }
-
-    /// Check the status of a job (upload, training, deployment, etc.).
-    ///
-    /// # Arguments
-    ///
-    /// * `job_id` - ID of the job to check
-    ///
-    /// # Returns
-    ///
-    /// Returns a `StatusResponse` containing the current job status and progress.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use schlep_engine::{SchlepClient, Result};
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<()> {
-    /// let client = SchlepClient::new("your-api-key")?;
-    /// let status = client.status("job_123").await?;
-    /// println!("Status: {}", status.status);
-    /// if let Some(progress) = status.progress {
-    ///     println!("Progress: {}%", progress);
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn status(&self, job_id: &str) -> Result<StatusResponse> {
-        let url = format!("{}/status/{}", self.base_url, job_id);
-
-        let response = self
-            .client
-            .get(&url)
-            .headers(self.default_headers()?)
-            .send()
-            .await?;
-
-        self.handle_response(response).await
-    }
-
-    /// Stream real-time events from Schlep-engine.
-    ///
-    /// This is a basic WebSocket streaming implementation. For production use,
-    /// you may want to implement more sophisticated event handling and reconnection logic.
-    ///
-    /// # Arguments
-    ///
-    /// * `events` - Configuration for the types of events to stream
-    ///
-    /// # Returns
-    ///
-    /// Returns a stream of `StreamEvent` objects.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use schlep_engine::{SchlepClient, StreamConfig, Result};
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<()> {
-    /// let client = SchlepClient::new("your-api-key")?;
-    /// let config = StreamConfig {
-    ///     event_types: vec!["training".to_string(), "deployment".to_string()],
-    ///     filters: Default::default(),
-    /// };
-    ///
-    /// // Note: This is a simplified example. In practice, you'd want to
-    /// // handle the stream in a loop and implement proper error handling.
-    /// client.stream(config).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn stream(&self, events: StreamConfig) -> Result<()> {
-        let ws_url = self.base_url.replace("https://", "wss://").replace("http://", "ws://");
-        let url = format!("{}/stream", ws_url);
-
-        let url = Url::parse(&url)?;
-        let (_ws_stream, _) = connect_async(url).await
-            .map_err(|e| Error::WebSocket(e.to_string()))?;
-
-        // Send subscription message
-        let _subscription = serde_json::json!({
-            "action": "subscribe",
-            "events": events,
-            "auth": {
-                "api_key": self.api_key
-            }
-        });
-
-        // This is a basic implementation - in practice you'd want to handle
-        // the stream properly with a loop and error handling
-        println!("WebSocket connection established for streaming");
+        if status == 401 || status == 403 {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(IgrisError::Authentication { message: text, status_code: status });
+        }
+        if status >= 400 {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(IgrisError::Api { message: text, status_code: status });
+        }
         Ok(())
     }
 
-    /// Create default headers for API requests.
-    fn default_headers(&self) -> Result<HeaderMap> {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.api_key))
-                .map_err(|e| Error::config_error(format!("Invalid API key format: {}", e)))?,
-        );
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        Ok(headers)
-    }
+    pub(crate) async fn send_json_no_response(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &impl serde::Serialize,
+    ) -> Result<(), IgrisError> {
+        let resp = self.http.request(method, self.url(path)).json(body).send().await?;
+        let status = resp.status().as_u16();
 
-    /// Handle HTTP response and parse JSON or return appropriate error.
-    async fn handle_response<T>(&self, response: Response) -> Result<T>
-    where
-        T: for<'de> serde::Deserialize<'de>,
-    {
-        let status = response.status();
-        let response_text = response.text().await?;
-
-        if status.is_success() {
-            serde_json::from_str(&response_text)
-                .map_err(|e| Error::invalid_response(format!("Failed to parse response: {}", e)))
-        } else {
-            // Try to parse error response
-            if let Ok(error_json) = serde_json::from_str::<Value>(&response_text) {
-                let message = error_json["message"]
-                    .as_str()
-                    .unwrap_or("Unknown API error")
-                    .to_string();
-                Err(Error::api_error(status.as_u16(), message))
-            } else {
-                Err(Error::api_error(status.as_u16(), response_text))
-            }
+        if status == 401 || status == 403 {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(IgrisError::Authentication { message: text, status_code: status });
         }
-    }
-
-    // ========== Helper methods for API modules ==========
-
-    /// Make a GET request to the API.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - API endpoint path
-    ///
-    /// # Type Parameters
-    ///
-    /// * `T` - Response type that implements Deserialize
-    pub(crate) async fn get<T>(&self, path: &str) -> Result<T>
-    where
-        T: for<'de> serde::Deserialize<'de>,
-    {
-        let url = format!("{}{}", self.base_url, path);
-        let response = self
-            .client
-            .get(&url)
-            .headers(self.default_headers()?)
-            .send()
-            .await?;
-
-        self.handle_response(response).await
-    }
-
-    /// Make a POST request to the API.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - API endpoint path
-    /// * `body` - JSON body to send
-    pub(crate) async fn post<T>(&self, path: &str, body: Value) -> Result<T>
-    where
-        T: for<'de> serde::Deserialize<'de>,
-    {
-        let url = format!("{}{}", self.base_url, path);
-        let response = self
-            .client
-            .post(&url)
-            .headers(self.default_headers()?)
-            .json(&body)
-            .send()
-            .await?;
-
-        self.handle_response(response).await
-    }
-
-    /// Make a PUT request to the API.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - API endpoint path
-    /// * `body` - JSON body to send
-    pub(crate) async fn put<T>(&self, path: &str, body: Value) -> Result<T>
-    where
-        T: for<'de> serde::Deserialize<'de>,
-    {
-        let url = format!("{}{}", self.base_url, path);
-        let response = self
-            .client
-            .put(&url)
-            .headers(self.default_headers()?)
-            .json(&body)
-            .send()
-            .await?;
-
-        self.handle_response(response).await
-    }
-
-    /// Make a DELETE request to the API.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - API endpoint path
-    pub(crate) async fn delete<T>(&self, path: &str) -> Result<T>
-    where
-        T: for<'de> serde::Deserialize<'de>,
-    {
-        let url = format!("{}{}", self.base_url, path);
-        let response = self
-            .client
-            .delete(&url)
-            .headers(self.default_headers()?)
-            .send()
-            .await?;
-
-        self.handle_response(response).await
-    }
-
-    /// Make a POST request with multipart form data.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - API endpoint path
-    /// * `form` - Multipart form to send
-    pub(crate) async fn post_multipart<T>(&self, path: &str, form: reqwest::multipart::Form) -> Result<T>
-    where
-        T: for<'de> serde::Deserialize<'de>,
-    {
-        let url = format!("{}{}", self.base_url, path);
-
-        // Create headers without Content-Type (reqwest sets it automatically for multipart)
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.api_key))
-                .map_err(|e| Error::config_error(format!("Invalid API key format: {}", e)))?,
-        );
-
-        let response = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .multipart(form)
-            .send()
-            .await?;
-
-        self.handle_response(response).await
-    }
-
-    /// Download binary data from the API.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - API endpoint path
-    pub(crate) async fn download(&self, path: &str) -> Result<Vec<u8>> {
-        let url = format!("{}{}", self.base_url, path);
-        let response = self
-            .client
-            .get(&url)
-            .headers(self.default_headers()?)
-            .send()
-            .await?;
-
-        let status = response.status();
-        if status.is_success() {
-            Ok(response.bytes().await?.to_vec())
-        } else {
-            let response_text = response.text().await?;
-            if let Ok(error_json) = serde_json::from_str::<Value>(&response_text) {
-                let message = error_json["message"]
-                    .as_str()
-                    .unwrap_or("Unknown API error")
-                    .to_string();
-                Err(Error::api_error(status.as_u16(), message))
-            } else {
-                Err(Error::api_error(status.as_u16(), response_text))
-            }
+        if status >= 400 {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(IgrisError::Api { message: text, status_code: status });
         }
+        Ok(())
     }
 
-    // ========== API Client Accessors ==========
+    // ── Auth ──
 
-    /// Access the Data Processing API.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use schlep_engine::{SchlepClient, Result};
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<()> {
-    /// let client = SchlepClient::new("your-api-key")?;
-    /// let file_data = std::fs::read("data.csv")?;
-    /// let result = client.data().process_file(&file_data, "csv").await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn data(&self) -> DataClient<'_> {
-        DataClient::new(self)
+    pub async fn login(&self, api_key: Option<&str>) -> Result<serde_json::Value, IgrisError> {
+        let key = api_key.or(self.api_key.as_deref()).unwrap_or_default();
+        let body = serde_json::json!({"api_key": key});
+        self.request(reqwest::Method::POST, "/v1/auth/login", Some(&body)).await
     }
 
-    /// Access the ML Pipeline API.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use schlep_engine::{SchlepClient, Result};
-    /// # use serde_json::json;
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<()> {
-    /// let client = SchlepClient::new("your-api-key")?;
-    /// let config = json!({"name": "My Pipeline", "task_type": "classification"});
-    /// let pipeline = client.ml().create_pipeline(config).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn ml(&self) -> MLClient<'_> {
-        MLClient::new(self)
+    pub async fn refresh_token(&self) -> Result<serde_json::Value, IgrisError> {
+        self.request::<serde_json::Value>(reqwest::Method::POST, "/v1/auth/refresh", None::<&()>.as_ref()).await
     }
 
-    /// Access the Analytics API.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use schlep_engine::{SchlepClient, Result};
-    /// # use serde_json::json;
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<()> {
-    /// let client = SchlepClient::new("your-api-key")?;
-    /// let query = json!({"sql": "SELECT * FROM users"});
-    /// let result = client.analytics().execute_query(query).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn analytics(&self) -> AnalyticsClient<'_> {
-        AnalyticsClient::new(self)
+    pub async fn logout(&self) -> Result<(), IgrisError> {
+        self.request_no_body(reqwest::Method::POST, "/v1/auth/logout").await
     }
 
-    /// Access the Document Extraction API.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use schlep_engine::{SchlepClient, Result};
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<()> {
-    /// let client = SchlepClient::new("your-api-key")?;
-    /// let file_data = std::fs::read("document.pdf")?;
-    /// let result = client.document().extract_text(&file_data, "pdf").await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn document(&self) -> DocumentClient<'_> {
-        DocumentClient::new(self)
+    // ── Inference ──
+
+    pub async fn infer(&self, request: &InferRequest) -> Result<InferResponse, IgrisError> {
+        self.request(reqwest::Method::POST, "/v1/infer", Some(request)).await
     }
 
-    /// Access the Data Quality API.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use schlep_engine::{SchlepClient, Result};
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<()> {
-    /// let client = SchlepClient::new("your-api-key")?;
-    /// let assessment = client.quality().assess_quality("job_123").await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn quality(&self) -> QualityClient<'_> {
-        QualityClient::new(self)
+    pub async fn chat_completion(&self, request: &InferRequest) -> Result<InferResponse, IgrisError> {
+        self.request(reqwest::Method::POST, "/v1/chat/completions", Some(request)).await
     }
 
-    /// Access the Storage API.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use schlep_engine::{SchlepClient, Result};
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<()> {
-    /// let client = SchlepClient::new("your-api-key")?;
-    /// let file_data = std::fs::read("data.csv")?;
-    /// let result = client.storage().upload_file(&file_data, "data.csv").await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn storage(&self) -> StorageClient<'_> {
-        StorageClient::new(self)
+    pub async fn list_models(&self) -> Result<ModelsResponse, IgrisError> {
+        self.request::<ModelsResponse>(reqwest::Method::GET, "/v1/models", None::<&()>.as_ref()).await
     }
 
-    /// Access the Monitoring API.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use schlep_engine::{SchlepClient, Result};
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<()> {
-    /// let client = SchlepClient::new("your-api-key")?;
-    /// let health = client.monitoring().get_health().await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn monitoring(&self) -> MonitoringClient<'_> {
-        MonitoringClient::new(self)
+    pub async fn health(&self) -> Result<HealthResponse, IgrisError> {
+        self.request::<HealthResponse>(reqwest::Method::GET, "/v1/health", None::<&()>.as_ref()).await
     }
 
-    /// Access the Users API.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use schlep_engine::{SchlepClient, Result};
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<()> {
-    /// let client = SchlepClient::new("your-api-key")?;
-    /// let profile = client.users().get_profile().await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn users(&self) -> UsersClient<'_> {
-        UsersClient::new(self)
+    pub async fn provider_stats(&self) -> Result<serde_json::Value, IgrisError> {
+        self.request::<serde_json::Value>(reqwest::Method::GET, "/v1/providers/stats", None::<&()>.as_ref()).await
     }
 
-    /// Access the Admin API.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use schlep_engine::{SchlepClient, Result};
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<()> {
-    /// let client = SchlepClient::new("your-api-key")?;
-    /// let stats = client.admin().get_system_stats().await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn admin(&self) -> AdminClient<'_> {
-        AdminClient::new(self)
+    // ── Sub-managers ──
+
+    pub fn providers(&self) -> ProviderManager<'_> {
+        ProviderManager::new(self)
+    }
+
+    pub fn vault(&self) -> VaultManager<'_> {
+        VaultManager::new(self)
+    }
+
+    pub fn fleet(&self) -> FleetManager<'_> {
+        FleetManager::new(self)
+    }
+
+    pub fn usage(&self) -> UsageManager<'_> {
+        UsageManager::new(self)
+    }
+
+    pub fn audit(&self) -> AuditManager<'_> {
+        AuditManager::new(self)
+    }
+
+    // ── BYOK Convenience Aliases ──
+
+    /// Store a provider API key in the vault.
+    pub async fn upload_key(&self, provider: &str, api_key: &str) -> Result<VaultKey, IgrisError> {
+        self.vault().store(&VaultStoreRequest {
+            provider: provider.to_string(),
+            api_key: api_key.to_string(),
+            config: None,
+        }).await
+    }
+
+    /// Rotate a provider API key.
+    pub async fn rotate_key(&self, provider: &str) -> Result<VaultKey, IgrisError> {
+        self.vault().rotate(provider).await
+    }
+
+    /// List all stored vault keys.
+    pub async fn list_keys(&self) -> Result<Vec<VaultKey>, IgrisError> {
+        self.vault().list().await
     }
 }
